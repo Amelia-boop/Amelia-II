@@ -3,6 +3,7 @@ from PIL import Image
 import google.generativeai as genai
 import os
 from pynput import keyboard, mouse
+from pynput.keyboard import Controller as KeyboardController
 import threading
 import logging
 from typing import Tuple, Optional
@@ -11,11 +12,20 @@ import time
 import random
 import re
 
-# C:/Users/rpsin/OneDrive/Desktop/Files/lifeLine/.venv/Scripts/Activate.ps1
-
 # --- CONFIG ---
-API_KEY = ""
+API_KEY_PRIMARY = ""
+API_KEY_SECONDARY = ""
 
+# API request management
+REQUEST_LIMIT_BEFORE_SWITCH = 20  # Switch to secondary key after this many requests
+api_request_count = 0
+current_api_key = API_KEY_PRIMARY
+api_key_lock = threading.Lock()
+
+# Image compression settings
+MAX_IMAGE_WIDTH = 1024  # Reduce image width to this max
+MAX_IMAGE_HEIGHT = 1024  # Reduce image height to this max
+IMAGE_QUALITY = 85  # JPEG quality (1-100)
 
 SCREENSHOT_DIR = "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -52,10 +62,6 @@ is_typing_active = False
 is_typing_paused = False
 current_typing_position = 0
 resume_typing_event = threading.Event()
-input_suppression_active = False
-input_suppression_listener = None
-ctrl_pressed = False
-alt_pressed = False
 
 # Set absolute log path
 log_file_path = os.path.join(os.getcwd(), "mcq_automator.log")
@@ -88,8 +94,107 @@ def handle_exception(exc_type, exc_value, exc_traceback):
 sys.excepthook = handle_exception
 
 # --- Initialize Gemini ---
-genai.configure(api_key=API_KEY)
+genai.configure(api_key=current_api_key)
 model = genai.GenerativeModel("gemini-2.5-flash")
+
+
+def increment_api_request() -> None:
+    """
+    Increments the API request counter and switches to secondary API key if limit is reached.
+    Thread-safe implementation.
+    """
+    global api_request_count, current_api_key, model
+
+    with api_key_lock:
+        api_request_count += 1
+        logger.info(
+            f"📊 API Request Count: {api_request_count}/{REQUEST_LIMIT_BEFORE_SWITCH}"
+        )
+
+        if (
+            api_request_count >= REQUEST_LIMIT_BEFORE_SWITCH
+            and current_api_key == API_KEY_PRIMARY
+        ):
+            current_api_key = API_KEY_SECONDARY
+            genai.configure(api_key=current_api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            logger.warning(
+                f"⚠️ REQUEST LIMIT REACHED ({REQUEST_LIMIT_BEFORE_SWITCH} requests)"
+            )
+            logger.warning("🔄 SWITCHED TO SECONDARY API KEY")
+            logger.info("✅ Secondary API key configured successfully")
+
+
+def compress_image(image_path: str) -> Image.Image:
+    """
+    Loads and compresses an image to reduce size before sending to Gemini.
+
+    Args:
+        image_path (str): Path to the original image
+
+    Returns:
+        PIL.Image.Image: Compressed image object
+    """
+    try:
+        with Image.open(image_path) as image:
+            original_size = os.path.getsize(image_path)
+
+            # Calculate new dimensions while maintaining aspect ratio
+            width, height = image.size
+            if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+                ratio = min(MAX_IMAGE_WIDTH / width, MAX_IMAGE_HEIGHT / height)
+                new_width = int(width * ratio)
+                new_height = int(height * ratio)
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.info(
+                    f"🔧 Resized image from {width}x{height} to {new_width}x{new_height}"
+                )
+
+            # Convert to RGB if necessary (for JPEG compatibility)
+            if image.mode in ("RGBA", "LA", "P"):
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                if image.mode == "P":
+                    image = image.convert("RGBA")
+                background.paste(
+                    image,
+                    mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None,
+                )
+                image = background
+
+            # Create unique temp file to avoid conflicts
+            import tempfile
+            import uuid
+
+            temp_filename = f"compressed_{uuid.uuid4().hex[:8]}.jpg"
+            compressed_path = os.path.join(SCREENSHOT_DIR, temp_filename)
+
+            image.save(compressed_path, "JPEG", quality=IMAGE_QUALITY, optimize=True)
+
+        compressed_size = os.path.getsize(compressed_path)
+        reduction = ((original_size - compressed_size) / original_size) * 100
+        logger.info(
+            f"📉 Image compressed: {original_size} bytes → {compressed_size} bytes ({reduction:.1f}% reduction)"
+        )
+
+        # Load compressed image and keep it in memory
+        with Image.open(compressed_path) as compressed_img:
+            # Create a copy to keep in memory
+            result = compressed_img.copy()
+
+        # Now safe to delete the temp file
+        try:
+            os.remove(compressed_path)
+        except Exception as cleanup_error:
+            # If deletion fails, log but don't crash - file will be cleaned up later
+            logger.debug(f"⚠️ Temp file cleanup delayed: {cleanup_error}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ Image compression failed: {e}")
+        # Return original image if compression fails
+        return Image.open(image_path)
+
 
 # Shared state for coordination
 ai_response_ready = threading.Event()
@@ -121,7 +226,7 @@ def solve_current_mcq() -> None:
         logger.error("❌ Question capture cancelled.")
         return
 
-    logger.info("🖱️  Please click BOTTOM-RIGHT of question region...")
+    logger.info("MouseClicked Please click BOTTOM-RIGHT of question region...")
     bottom_right = capture_single_click()
     if not bottom_right:
         logger.error("❌ Question capture cancelled.")
@@ -147,7 +252,7 @@ def solve_current_mcq() -> None:
     # --- Capture ALL Option Positions (any number) ---
     logger.info("\n" + "🟩" * 50)
     logger.info(
-        "🖱️  Now click each option in order (click ALL options, then press Enter when done)"
+        "MouseClicked Now click each option in order (click ALL options, then press Enter when done)"
     )
     logger.info("🟩" * 50)
 
@@ -176,7 +281,7 @@ def solve_current_mcq() -> None:
     keyboard_listener.start()
 
     # Wait for user to indicate they're done
-    logger.info("🖱️  Click all options, then press Enter to continue...")
+    logger.info("MouseClicked Click all options, then press Enter to continue...")
     done.wait(timeout=120)  # Wait up to 120 seconds
 
     # Clean up listeners
@@ -220,6 +325,7 @@ def solve_current_mcq() -> None:
             logger.error(f"❌ Error with Gemini: {e}")
         finally:
             ai_response_ready.set()
+            os.remove(QUESTION_IMAGE_PATH)  # Clean up question image
 
     threading.Thread(target=ai_worker, daemon=True).start()
 
@@ -241,7 +347,7 @@ def solve_current_mcq() -> None:
         return
 
     # --- Click Correct Option ---
-    logger.info("🖱️  Clicking correct option...")
+    logger.info("MouseClicked clicking correct option...")
     try:
         screen_x, screen_y = option_positions_global[correct_index_global - 1]
         pyautogui.moveTo(screen_x, screen_y, duration=0.3)
@@ -318,28 +424,64 @@ def generate_ai_response() -> None:
     def ai_worker():
         global ai_response_text
         try:
-            # Load all images
-            images = [Image.open(path) for path in subjective_screenshots]
+            increment_api_request()
 
-            # Enhanced prompt for better code formatting
+            # Load and compress all images
+            images = [compress_image(path) for path in subjective_screenshots]
             prompt = """
-                    You are an expert problem solver.
-                    For coding problems:
-                    1. Always write the complete solution in Java inside a single public class named Solution
-                    2. No indentation at all (the compiler will auto-indent)
-                    3. No comments in the code
-                    4. No extra spaces at the start of lines
-                    5. Method bodies use standard Java braces style
-                    6. No trailing whitespace at the end of lines
-                    7. Line breaks only between logical code sections
-                    8. Output only the code in plain text for direct copy-paste
+You are taking an exam. You are an expert academic assistant who gives precise, rubric-following answers to subjective questions in an objective, professional academic style.
 
-                    For subjective or theoretical questions:
-                    1. Give only the direct final answer
-                    2. No explanations, no steps, no extra text
-                    3. No comments or markdown formatting
-                    """
+ANALYSIS PHASE:
+1. Carefully analyze the question to identify ALL specified requirements, constraints, and rubrics
+2. Note any specific formatting instructions, length requirements, or structural elements required
+3. Identify key concepts, terminology, and depth of explanation needed
+4. Determine if examples, calculations, or specific methodologies are required
 
+RESPONSE PHASE:
+1. Format your response EXACTLY as required by the question's rubrics - no deviations
+2. Write in an objective, impersonal academic style
+3. If the question specifies word count, paragraph structure, or section headings, follow them precisely
+4. Include ONLY what is explicitly asked for - no introductions, conclusions, or extra explanations
+5. Use the exact terminology and notation specified in the question
+6. If calculations are required, show ONLY the final calculation format as specified (no working steps unless explicitly requested)
+7. For theoretical questions, provide ONLY the direct answer without explanations
+8. For coding problems only provide solution to the question in JAVA language, provide ONLY the code with no comments or extra text
+
+COPY-PASTE READY FORMAT:
+- NO markdown formatting
+- NO introductory phrases ("The answer is:", "Here is the solution:", etc.)
+- NO concluding statements
+- NO bullet points or numbered lists unless explicitly required by the question
+- NO extra line breaks beyond what's required by the rubrics
+- NO comments in code solutions
+- For coding: Only provide the complete, executable code with proper indentation as required by the language
+- For essays: Follow the exact paragraph structure specified in the question
+
+EXAMPLES OF PROPER RESPONSES:
+For a coding question requiring a Java function:
+"public class Solution {
+    public static int calculateSum(int a, int b) {
+        return a + b;
+    }
+}"
+
+For a theoretical question asking for a definition:
+"Photosynthesis is the process by which green plants and some other organisms use sunlight to synthesize foods with the help of chlorophyll."
+
+For a question asking "Explain Newton's First Law":
+"An object at rest stays at rest and an object in motion stays in motion with the same speed and in the same direction unless acted upon by an unbalanced force."
+
+For a question specifying "Answer in 2 bullet points":
+"- First point\n- Second point"
+
+STRICT INSTRUCTIONS:
+- NEVER add explanations, reasoning, or additional content beyond what's explicitly required
+- If the question has multiple parts, address each part in the exact order specified
+- If word count is specified, adhere to it precisely (e.g., "Answer in 50 words or less")
+- Your response must be ready for immediate copy-pasting into the answer field without any editing
+- Write in a way that feels authentic and human, avoiding detectable AI patterns like overly perfect grammar or repetitive phrasing
+- Incorporate natural variations in language while maintaining academic accuracy
+"""
             content = [prompt] + images
             response = model.generate_content(content)
             raw_response = response.text.strip()
@@ -372,88 +514,12 @@ def generate_ai_response() -> None:
     logger.info("⏳ AI is working... You can press Ctrl+Alt+T later when ready.")
 
 
-def on_key_press(key):
-    """Handle key press events for input suppression"""
-    global ctrl_pressed, alt_pressed, is_typing_active, is_typing_paused
-
-    # Update modifier state
-    if (
-        key == keyboard.Key.ctrl
-        or key == keyboard.Key.ctrl_l
-        or key == keyboard.Key.ctrl_r
-    ):
-        ctrl_pressed = True
-    elif (
-        key == keyboard.Key.alt
-        or key == keyboard.Key.alt_l
-        or key == keyboard.Key.alt_r
-    ):
-        alt_pressed = True
-    elif (
-        key == keyboard.KeyCode.from_char("z")
-        and ctrl_pressed
-        and alt_pressed
-        and is_typing_active
-    ):
-        # Check for resume hotkey (Ctrl+Alt+Z)
-        if is_typing_paused:
-            resume_typing_event.set()
-            logger.info("⏯️ Resume hotkey pressed. Resuming typing...")
-        return True  # Allow the key to pass through
-
-    # Block all other keys during active typing
-    if is_typing_active and not is_typing_paused:
-        return False
-
-    return True
-
-
-def on_key_release(key):
-    """Handle key release events for input suppression"""
-    global ctrl_pressed, alt_pressed
-
-    # Update modifier state
-    if (
-        key == keyboard.Key.ctrl
-        or key == keyboard.Key.ctrl_l
-        or key == keyboard.Key.ctrl_r
-    ):
-        ctrl_pressed = False
-    elif (
-        key == keyboard.Key.alt
-        or key == keyboard.Key.alt_l
-        or key == keyboard.Key.alt_r
-    ):
-        alt_pressed = False
-
-
-def start_input_suppression():
-    """Start suppressing keyboard input"""
-    global input_suppression_listener
-    input_suppression_listener = keyboard.Listener(
-        on_press=on_key_press, on_release=on_key_release
-    )
-    input_suppression_listener.start()
-    logger.info("🔇 Input suppression activated")
-
-
-def stop_input_suppression():
-    """Stop suppressing keyboard input"""
-    global input_suppression_listener
-    if input_suppression_listener and input_suppression_listener.is_alive():
-        input_suppression_listener.stop()
-        logger.info("🔊 Input suppression deactivated")
-
-
 def auto_type_response() -> None:
     """
-    Types the stored AI response in a human-like way.
-    Pauses if mouse click is detected (focus loss).
-    Can be resumed from where it left off with resume hotkey.
-    Triggered by Ctrl+Alt+T.
+    Types the stored AI response with intelligent editor-aware indentation handling.
+    Specifically handles code blocks to prevent double indentation.
     """
-    global ai_response_text, ai_response_ready_subjective
-    global is_typing_active, is_typing_paused, current_typing_position, resume_typing_event
+    global ai_response_text, is_typing_active, is_typing_paused, current_typing_position
 
     # Reset typing state
     is_typing_active = True
@@ -468,54 +534,115 @@ def auto_type_response() -> None:
             is_typing_active = False
             return
 
+    logger.info("⚠️ DO NOT TYPE OR CLICK DURING AUTO-TYPING! (Click will PAUSE typing)")
     logger.info("⌨️  Starting auto-type in 3 seconds. Click target field now...")
     time.sleep(3)
 
-    # Start input suppression
-    start_input_suppression()
-
-    # Setup mouse listener to detect focus loss (mouse click)
+    # State tracking for code context
+    brace_stack = []  # Tracks { and } for proper block detection
+    current_indent = 0
+    indent_size = 4  # Standard indentation size (spaces)
+    i = 0
     mouse_listener = None
 
+    # Mouse click handler for pause detection
     def on_mouse_click(x, y, button, pressed):
-        # Use global for module-level variables
-        global is_typing_paused, is_typing_active
-
+        nonlocal mouse_listener
         if pressed and button == mouse.Button.left and is_typing_active:
+            # Set paused state
+            global is_typing_paused
             is_typing_paused = True
-            logger.info(
-                "MouseClicked Mouse click detected. Pausing typing (focus lost)."
-            )
-            # Stop input suppression while paused (so user can type normally)
-            stop_input_suppression()
-            return False  # Stop the listener
 
-    mouse_listener = mouse.Listener(on_click=on_mouse_click)
-    mouse_listener.start()
+            # Clean up current listener
+            if mouse_listener and mouse_listener.is_alive():
+                mouse_listener.stop()
+                mouse_listener = None
+
+            logger.info("⏸️ Mouse click detected. Pausing typing (focus loss).")
+            return False  # Stop listener
+        return True
 
     try:
-        while current_typing_position < len(ai_response_text) and is_typing_active:
+        # Start mouse listener
+        mouse_listener = mouse.Listener(on_click=on_mouse_click)
+        mouse_listener.start()
+
+        while i < len(ai_response_text) and is_typing_active:
+            # Handle pause state
             if is_typing_paused:
-                logger.info("⏸️ Typing paused. Press Ctrl+Alt+Z to resume...")
+                logger.info(
+                    f"⏸️ Typing paused at position {i}. Press Ctrl+Alt+Z to resume..."
+                )
+                # Wait for resume signal
                 resume_typing_event.wait()
                 resume_typing_event.clear()
+
+                # Reset pause state
                 is_typing_paused = False
-                # Restart input suppression
-                start_input_suppression()
-                # Restart mouse listener after resuming
+
+                # Restart mouse listener
+                if mouse_listener and mouse_listener.is_alive():
+                    mouse_listener.stop()
                 mouse_listener = mouse.Listener(on_click=on_mouse_click)
                 mouse_listener.start()
+
+                # Release any held modifier keys
+                keyboard_controller = KeyboardController()
+                keyboard_controller.release(keyboard.Key.ctrl)
+                keyboard_controller.release(keyboard.Key.alt)
+                keyboard_controller.release(keyboard.Key.shift)
+                time.sleep(0.1)
+
                 continue
 
-            # Type the next character
-            char = ai_response_text[current_typing_position]
-            pyautogui.write(char, interval=0.03)
-            current_typing_position += 1
+            char = ai_response_text[i]
 
-            # Add natural pauses - FIXED: Using random module correctly
-            if ord(char) % 10 == 0:
-                # Make sure to use the random module correctly
-                time.sleep(random.uniform(0.1, 0.3))
+            # Update code context state based on current character
+            if char == "{":
+                brace_stack.append(i)
+            elif char == "}" and brace_stack:
+                brace_stack.pop()
+
+            # Special handling for newlines
+            if char in ["\n", "\r"]:
+                # Press Enter (editor will auto-indent)
+                pyautogui.press("enter")
+                time.sleep(0.05)  # Let editor apply auto-indent
+
+                # Check if we're inside a code block (have unclosed braces)
+                in_code_block = bool(brace_stack)
+
+                # Skip AI's indentation if editor already provided it
+                if in_code_block:
+                    # Count leading spaces in AI response for next line
+                    j = i + 1
+                    ai_indent = 0
+                    while j < len(ai_response_text) and ai_response_text[j] == " ":
+                        ai_indent += 1
+                        j += 1
+
+                    # Skip spaces if editor already indented
+                    if ai_indent > 0:
+                        logger.debug(f"⏭️ Skipping {ai_indent} auto-indent spaces")
+                        i = j - 1  # Skip to after indentation
+                else:
+                    # Outside code blocks - just skip any leading spaces
+                    j = i + 1
+                    while j < len(ai_response_text) and ai_response_text[j] == " ":
+                        j += 1
+                    i = j - 1
+
+                i += 1  # Move past newline
+                continue
+
+            # Handle regular characters
+            pyautogui.write(char, interval=random.uniform(0.03, 0.08))
+            i += 1
+            current_typing_position = i
+
+            # Natural typing rhythm
+            if i % 15 == 0:
+                time.sleep(random.uniform(0.05, 0.15))
 
         logger.info("✅ Finished typing AI response.")
     except Exception as e:
@@ -523,10 +650,8 @@ def auto_type_response() -> None:
     finally:
         is_typing_active = False
         # Clean up mouse listener
-        if mouse_listener and mouse_listener.running:
+        if mouse_listener and mouse_listener.is_alive():
             mouse_listener.stop()
-        # Stop input suppression
-        stop_input_suppression()
 
 
 def on_capture_subjective() -> None:
@@ -552,10 +677,18 @@ def on_resume_typing() -> None:
     global is_typing_paused, resume_typing_event
 
     if is_typing_paused and is_typing_active:
+        # Release any held modifier keys before resuming
+        keyboard_controller = KeyboardController()
+        keyboard_controller.release(keyboard.Key.ctrl)
+        keyboard_controller.release(keyboard.Key.alt)
+        keyboard_controller.release(keyboard.Key.shift)
+        time.sleep(0.1)
+
         resume_typing_event.set()
         logger.info(
             f"⏯️ Resume hotkey pressed. Resuming typing from position {current_typing_position}..."
         )
+        time.sleep(0.2)  # Prevent immediate re-pause from mouse movement
     elif not is_typing_active:
         logger.info("⏯️ No active typing session to resume.")
     else:
@@ -563,7 +696,11 @@ def on_resume_typing() -> None:
 
 
 def on_clear_context() -> None:
-    """Enhanced: Also clears subjective mode"""
+    """
+    Enhanced: Also clears subjective mode
+    Clears the captured context.
+    Triggered by Ctrl+Alt+R.
+    """
     global context_captured, subjective_screenshots, ai_response_text
     context_captured = False
     subjective_screenshots = []
@@ -611,16 +748,6 @@ def capture_context() -> None:
         logger.error(f"❌ Failed to save context: {e}")
 
 
-def clear_context() -> None:
-    """
-    Clears the captured context.
-    Triggered by Ctrl+Alt+R.
-    """
-    global context_captured
-    context_captured = False
-    logger.info("🧹 Context cleared. Future MCQs will NOT include context.")
-
-
 def get_correct_option_index(image_path: str, num_options: int = 4) -> Optional[int]:
     """
     Single-image mode — for standalone MCQs
@@ -647,7 +774,9 @@ def get_correct_option_index(image_path: str, num_options: int = 4) -> Optional[
         The prompt is designed to force AI to respond with ONLY a single digit (1 to num_options).
     """
     try:
-        image = Image.open(image_path)
+        increment_api_request()
+
+        image = compress_image(image_path)
         prompt = f"""
         You are an expert in answering multiple choice questions.
         The image shows a question with {num_options} vertically listed options.
@@ -674,8 +803,10 @@ def get_correct_option_index_with_context(
 ) -> Optional[int]:
     """Two-image mode — for comprehension-based MCQs."""
     try:
-        context_img = Image.open(context_image_path)
-        question_img = Image.open(question_image_path)
+        increment_api_request()
+
+        context_img = compress_image(context_image_path)
+        question_img = compress_image(question_image_path)
 
         prompt = f"""
         You are an expert in answering comprehension-based multiple choice questions.
@@ -749,12 +880,6 @@ def on_activate_question() -> None:
     threading.Thread(target=solve_current_mcq).start()
 
 
-def on_clear_context() -> None:
-    """Triggered by Ctrl+Alt+R"""
-    logger.info("[🧹 CLEAR CONTEXT HOTKEY PRESSED!]")
-    clear_context()
-
-
 def on_exit() -> None:
     """Triggered by Ctrl+Alt+E"""
     logger.info("🛑 Exiting...")
@@ -778,6 +903,9 @@ if __name__ == "__main__":
     logger.info(f"⏯️  Press {RESUME_TYPING_HOTKEY.upper()} to resume typing after pause")
     logger.info(f"🧹 Press {CLEAR_CONTEXT_HOTKEY.upper()} to clear everything")
     logger.info(f"🚪 Press {EXIT_HOTKEY.upper()} to quit")
+    logger.info(
+        "⚠️ IMPORTANT: During auto-typing, DO NOT TYPE OR CLICK (click will pause typing)"
+    )
 
     with keyboard.GlobalHotKeys(
         {
@@ -786,7 +914,7 @@ if __name__ == "__main__":
             CAPTURE_SUBJECTIVE_HOTKEY: on_capture_subjective,
             GENERATE_RESPONSE_HOTKEY: on_generate_response,
             TYPE_RESPONSE_HOTKEY: on_type_response,
-            RESUME_TYPING_HOTKEY: on_resume_typing,  # New resume hotkey
+            RESUME_TYPING_HOTKEY: on_resume_typing,
             CLEAR_CONTEXT_HOTKEY: on_clear_context,
             EXIT_HOTKEY: on_exit,
         }
